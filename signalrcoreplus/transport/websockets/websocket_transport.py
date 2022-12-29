@@ -12,19 +12,23 @@ from ...protocol.messagepack_protocol import MessagePackHubProtocol
 from ..base_transport import BaseTransport
 from ...helpers import Helpers
 
+
 class WebsocketTransport(BaseTransport):
-    def __init__(self,
-            url="",
-            headers=None,
-            keep_alive_interval=15,
-            reconnection_handler=None,
-            verify_ssl=False,
-            skip_negotiation=False,
-            enable_trace=False,
-            **kwargs):
+    def __init__(
+        self,
+        url="",
+        headers=None,
+        keep_alive_interval=15,
+        reconnection_handler=None,
+        verify_ssl=False,
+        skip_negotiation=False,
+        enable_trace=False,
+        **kwargs
+    ):
         super(WebsocketTransport, self).__init__(**kwargs)
         self._ws = None
         self.enable_trace = enable_trace
+        self._thread = None
         self.skip_negotiation = skip_negotiation
         self.url = url
         if headers is None:
@@ -38,8 +42,7 @@ class WebsocketTransport(BaseTransport):
         self._ws = None
         self.verify_ssl = verify_ssl
         self.connection_checker = ConnectionStateChecker(
-            lambda: self.send(PingMessage()),
-            keep_alive_interval
+            lambda: self.send(PingMessage()), keep_alive_interval
         )
         self.reconnection_handler = reconnection_handler
 
@@ -76,9 +79,13 @@ class WebsocketTransport(BaseTransport):
             on_open=self.on_open,
         )
 
-        self._ws.run_forever(
-            sslopt={"cert_reqs": ssl.CERT_NONE} if not self.verify_ssl else {},
+        self._thread = threading.Thread(
+            target=lambda: self._ws.run_forever(
+                sslopt={"cert_reqs": ssl.CERT_NONE} if not self.verify_ssl else {}
+            )
         )
+        self._thread.daemon = True
+        self._thread.start()
         return True
 
     def negotiate(self):
@@ -86,30 +93,32 @@ class WebsocketTransport(BaseTransport):
         self.logger.debug("Negotiate url:{0}".format(negotiate_url))
 
         response = requests.post(
-            negotiate_url, headers=self.headers, verify=self.verify_ssl)
-        self.logger.debug(
-            "Response status code{0}".format(response.status_code))
+            negotiate_url, headers=self.headers, verify=self.verify_ssl
+        )
+        self.logger.debug("Response status code{0}".format(response.status_code))
 
         if response.status_code != 200:
-            raise HubError(response.status_code)\
-                if response.status_code != 401 else UnAuthorizedHubError()
+            raise HubError(
+                response.status_code
+            ) if response.status_code != 401 else UnAuthorizedHubError()
 
         data = response.json()
 
         if "connectionId" in data.keys():
-            self.url = Helpers.encode_connection_id(
-                self.url, data["connectionId"])
+            self.url = Helpers.encode_connection_id(self.url, data["connectionId"])
 
         # Azure
-        if 'url' in data.keys() and 'accessToken' in data.keys():
+        if "url" in data.keys() and "accessToken" in data.keys():
             Helpers.get_logger().debug(
-                "Azure url, reformat headers, token and url {0}".format(data))
-            self.url = data["url"]\
-                if data["url"].startswith("ws") else\
-                Helpers.http_to_websocket(data["url"])
+                "Azure url, reformat headers, token and url {0}".format(data)
+            )
+            self.url = (
+                data["url"]
+                if data["url"].startswith("ws")
+                else Helpers.http_to_websocket(data["url"])
+            )
             self.token = data["accessToken"]
             self.headers = {"Authorization": "Bearer " + self.token}
-
 
     def evaluate_handshake(self, message):
         self.logger.debug("Evaluating handshake {0}".format(message))
@@ -164,7 +173,7 @@ class WebsocketTransport(BaseTransport):
         self.logger.error("{0} {1}".format(error, type(error)))
         self._on_close()
         self.state = ConnectionState.disconnected
-        #raise HubError(error)
+        # raise HubError(error)
 
     def on_message(self, app, raw_message):
         self.logger.debug("Message received{0}".format(raw_message))
@@ -179,29 +188,27 @@ class WebsocketTransport(BaseTransport):
 
             return []
 
-        return self._on_message(
-            self.protocol.parse_messages(raw_message))
+        return self._on_message(self.protocol.parse_messages(raw_message))
 
     def send(self, message):
         self.logger.debug("Sending message {0}".format(message))
         try:
             self._ws.send(
                 self.protocol.encode(message),
-                opcode=0x2
-                if type(self.protocol) == MessagePackHubProtocol else
-                0x1)
+                opcode=0x2 if type(self.protocol) == MessagePackHubProtocol else 0x1,
+            )
             self.connection_checker.last_message = time.time()
             if self.reconnection_handler is not None:
                 self.reconnection_handler.reset()
         except (
-                websocket._exceptions.WebSocketConnectionClosedException,
-                OSError) as ex:
+            websocket._exceptions.WebSocketConnectionClosedException,
+            OSError,
+        ) as ex:
             self.handshake_received = False
             self.logger.warning("Connection closed {0}".format(ex))
             self.state = ConnectionState.disconnected
             if self.reconnection_handler is None:
-                if self._on_close is not None and\
-                        callable(self._on_close):
+                if self._on_close is not None and callable(self._on_close):
                     self._on_close()
                 raise ValueError(str(ex))
             # Connection closed
@@ -210,8 +217,11 @@ class WebsocketTransport(BaseTransport):
             raise ex
 
     def handle_reconnect(self):
-        if not self.reconnection_handler.reconnecting and self._on_reconnect is not None and \
-                callable(self._on_reconnect):
+        if (
+            not self.reconnection_handler.reconnecting
+            and self._on_reconnect is not None
+            and callable(self._on_reconnect)
+        ):
             self._on_reconnect()
         self.reconnection_handler.reconnecting = True
         try:
@@ -220,10 +230,7 @@ class WebsocketTransport(BaseTransport):
         except Exception as ex:
             self.logger.error(ex)
             sleep_time = self.reconnection_handler.next()
-            threading.Thread(
-                target=self.deferred_reconnect,
-                args=(sleep_time,)
-            ).start()
+            threading.Thread(target=self.deferred_reconnect, args=(sleep_time,)).start()
 
     def deferred_reconnect(self, sleep_time):
         time.sleep(sleep_time)
